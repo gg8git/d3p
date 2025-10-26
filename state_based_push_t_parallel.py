@@ -833,83 +833,6 @@ class StateBasedDiffusionPolicy(nn.Module):
 
         return naction
 
-class StateBasedDiscreteDiffusionPolicy(nn.Module):
-    
-    def __init__(self, action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, scheduler):
-        super().__init__()
-        
-        self.num_timesteps = num_diffusion_iters
-        self.scheduler = scheduler
-
-        self.noise_pred_net = ConditionalUnet1D(
-            input_dim=embed_dim,
-            global_cond_dim=obs_dim*obs_horizon
-        )
-
-        # initialize tokenizer
-        from tokenization import BinningActionTokenizer
-        self.tokenizer = BinningActionTokenizer(
-            max_action_dim=action_dim,
-            action_chunk_size=16,
-            vocab_size=vocab_size,
-            contiguous_dimensions=False
-        )
-
-        # initialize embedding
-        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-
-    @staticmethod
-    def sample_categorical(probs):
-        shape = probs.shape[:-1]
-        probs_flat = probs.reshape(-1, probs.shape[-1])
-        samples = torch.multinomial(probs_flat, num_samples=1)  # (N, 1)
-        return samples.reshape(*shape)
-
-    def forward(self, nobs, naction, device):
-        B = nobs.shape[0]
-
-        # observation as FiLM conditioning
-        # (B, obs_horizon * obs_dim)
-        obs_cond = nobs
-        obs_cond = obs_cond.flatten(start_dim=1)
-
-        naction = self.tokenizer.tokenize(naction)
-        noise = torch.full_like(naction, 0, dtype=torch.long, device=device)
-
-        timesteps = torch.randint(
-            0, self.num_timesteps,
-            (B,), device=device
-        ).long()
-
-        noisy_actions = self.scheduler.noise_tokens(
-            naction, noise, 1 - (timesteps / self.num_timesteps))
-
-        noise_emb = self.token_embedding(noisy_actions)
-        noise_emb_pred = self.noise_pred_net(noise_emb, timesteps, global_cond=obs_cond)
-        noise_pred = (self.token_embedding.weight @ noise_emb_pred.transpose(1, 2)).transpose(1, 2)
-
-        loss = torch.nn.functional.cross_entropy(noise_pred.permute(0, 2, 1), naction)
-        return loss
-
-    def sample(self, nobs_t, pred_horizon, device):
-        B = nobs_t.shape[0]
-        obs_cond = nobs_t.flatten(start_dim=1)  # (B, H*D)
-
-        # Generate an action sequence for each obs
-        with torch.no_grad():
-            noisy_action = torch.full((B, pred_horizon * self.action_dim), 0, device=device)
-            naction = noisy_action
-
-            for k  in self.num_timesteps:
-                naction_emb = self.token_embedding(naction)
-                noise_emb_pred = self.noise_pred_net(naction_emb, k, global_cond=obs_cond)
-                noise_pred = (self.token_embedding.weight @ noise_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
-
-                naction = self.scheduler.step(naction, noise_pred, (1 - k / self.num_timesteps))
-
-        naction = self.tokenizer.detokenize(naction)
-        return naction
-
 class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
 
     def __init__(self, action_dim, vocab_size, embed_dim, obs_dim, obs_horizon):
@@ -918,7 +841,7 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
         self.num_timesteps = 1
         self.action_dim = action_dim
 
-        self.noise_pred_net = ConditionalUnet1D(
+        self.action_pred_net = ConditionalUnet1D(
             input_dim=embed_dim,
             global_cond_dim=obs_dim*obs_horizon
         )
@@ -956,10 +879,10 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
         timesteps = torch.full((B,), self.num_timesteps, device=device).long()
 
         noise_emb = self.token_embedding(noise)
-        noise_emb_pred = self.noise_pred_net(noise_emb, timesteps, global_cond=obs_cond)
-        noise_pred = (self.token_embedding.weight @ noise_emb_pred.transpose(1, 2)).transpose(1, 2)
+        action_emb_pred = self.action_pred_net(noise_emb, timesteps, global_cond=obs_cond)
+        action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)
 
-        loss = torch.nn.functional.cross_entropy(noise_pred.permute(0, 2, 1), naction)
+        loss = torch.nn.functional.cross_entropy(action_pred.permute(0, 2, 1), naction)
         return loss
 
     def sample(self, nobs_t, pred_horizon, device):
@@ -971,11 +894,104 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
             naction = torch.full((B, pred_horizon * self.action_dim), 0, device=device)
 
             naction_emb = self.token_embedding(naction)
-            noise_emb_pred = self.noise_pred_net(naction_emb, self.num_timesteps, global_cond=obs_cond)
-            noise_pred = (self.token_embedding.weight @ noise_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
+            action_emb_pred = self.action_pred_net(naction_emb, self.num_timesteps, global_cond=obs_cond)
+            action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
 
-            probs = torch.softmax(noise_pred, dim=-1).detach()
-            naction = self.sample_categorical(probs)
+            softmax_logits = torch.softmax(action_pred, dim=-1).detach()
+            naction = self.sample_categorical(softmax_logits)
+
+        naction = self.tokenizer.detokenize(naction)
+        return naction
+
+class StateBasedDiscreteDiffusionPolicy(nn.Module):
+    
+    def __init__(self, action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, schedule_name):
+        super().__init__()
+        
+        self.num_timesteps = num_diffusion_iters
+        self.action_dim = action_dim
+
+        self.action_pred_net = ConditionalUnet1D(
+            input_dim=embed_dim,
+            global_cond_dim=obs_dim*obs_horizon
+        )
+
+        # initialize tokenizer
+        from tokenization import BinningActionTokenizer
+        self.tokenizer = BinningActionTokenizer(
+            max_action_dim=action_dim,
+            action_chunk_size=16,
+            vocab_size=vocab_size,
+            contiguous_dimensions=False
+        )
+
+        # initialize embedding
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+
+        # initialize schedule
+        from schedules import get_schedule
+        self.schedule = get_schedule(schedule_name, self.num_timesteps, self.tokenizer.pad_token_id)
+
+    @staticmethod
+    def sample_categorical(probs):
+        shape = probs.shape[:-1]
+        probs_flat = probs.reshape(-1, probs.shape[-1])
+        samples = torch.multinomial(probs_flat, num_samples=1)  # (N, 1)
+        return samples.reshape(*shape)
+
+    def forward(self, nobs, naction, device):
+        B = nobs.shape[0]
+
+        # observation as FiLM conditioning
+        # (B, obs_horizon * obs_dim)
+        obs_cond = nobs
+        obs_cond = obs_cond.flatten(start_dim=1)
+
+        naction = self.tokenizer.tokenize(naction)
+        noise = torch.full_like(naction, 0, dtype=torch.long, device=device)
+
+        timesteps = torch.randint(
+            0, self.num_timesteps,
+            (B,), device=device
+        ).long()
+
+        noised_action = self.schedule.noise_tokens(
+            naction, noise, 1 - (timesteps.float() / self.num_timesteps)) # 0 -> 1, self.num_timesteps -> 0
+
+        noise_emb = self.token_embedding(noised_action)
+        action_emb_pred = self.action_pred_net(noise_emb, timesteps, global_cond=obs_cond)
+        action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)
+
+        loss = torch.nn.functional.cross_entropy(action_pred.permute(0, 2, 1), naction)
+        return loss
+
+    def sample(self, nobs_t, pred_horizon, device):
+        B = nobs_t.shape[0]
+        obs_cond = nobs_t.flatten(start_dim=1)  # (B, H*D)
+
+        # Generate an action sequence for each obs
+        with torch.no_grad():
+            noised_action = torch.full((B, pred_horizon * self.action_dim), 0, device=device)
+            naction = noised_action
+
+            timesteps = torch.arange(self.num_timesteps, 0, -1, device=device).long()
+            for k in timesteps:
+                naction_emb = self.token_embedding(naction)
+                action_emb_pred = self.action_pred_net(naction_emb, k, global_cond=obs_cond)
+                action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
+
+                softmax_logits = torch.softmax(action_pred, dim=-1).detach()
+                k_schedule = torch.full((B,), (1 - k.float() / self.num_timesteps), device=device)
+                naction, _ = self.schedule.step(naction, softmax_logits, k_schedule) # 0 -> 1, self.num_timesteps -> 0
+            
+            # k = self.num_timesteps
+            # while k > 0:
+            #     naction_emb = self.token_embedding(naction)
+            #     noise_emb_pred = self.noise_pred_net(naction_emb, k, global_cond=obs_cond)
+            #     noise_pred = (self.token_embedding.weight @ noise_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
+
+            #     naction, new_k = self.schedule.step(naction, noise_pred, (1 - k / self.num_timesteps)) # 0 -> 1, self.num_timesteps -> 0
+            #     k = (1 - new_k) * self.num_timesteps
 
         naction = self.tokenizer.detokenize(naction)
         return naction
@@ -987,16 +1003,15 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
 # the output of PushTEnv
 obs_dim = 5
 action_dim = 2
-num_diffusion_iters = 100
+num_diffusion_iters = 20
 
-vocab_size = 256
+vocab_size = 20
 embed_dim = 256
-from scheduler import VanillaD3MScheduler
-scheduler = VanillaD3MScheduler(num_diffusion_iters, False)
+schedule_name = "vanilla"
 
 # policy = StateBasedDiffusionPolicy(action_dim, obs_dim, obs_horizon, num_diffusion_iters)
-policy = StateBasedDiscreteDiffusionPolicy(action_dim, 256, 256, obs_dim, obs_horizon, num_diffusion_iters, scheduler)
-# policy = SingleStepStateBasedDiscreteDiffusionPolicy(action_dim, 256, 256, obs_dim, obs_horizon)
+# policy = SingleStepStateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon)
+policy = StateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, schedule_name)
 
 # # example inputs
 # noised_action = torch.randn((1, pred_horizon, action_dim))
@@ -1029,7 +1044,7 @@ policy = policy.to(device)
 # Initialize logger with wandb enabled for KitchenSink project
 logger = CustomSingletonLogger(use_wandb=True)
 
-num_epochs = 100
+num_epochs = 200
 
 # Exponential Moving Average
 # accelerates training and improves stability

@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 def NEG_INF_VALUE(dtype: torch.dtype):
     return torch.finfo(dtype).min
 
-class D3MScheduler(ABC):
+class D3MSchedule(ABC):
 
     @abstractmethod
     def noise_tokens(self, action_tokens, noise_tokens, t):
@@ -30,12 +30,12 @@ class D3MScheduler(ABC):
         if use_argmax:
             return torch.argmax(softmax_logits, dim=-1)
         else: 
-            flattened_logits = softmax_logits.view(-1, softmax_logits.size(-1))
+            flattened_logits = softmax_logits.reshape(-1, softmax_logits.size(-1))
             sampled_logits   = torch.multinomial(flattened_logits, 1).squeeze(-1)
-            reshaped_logits  = sampled_logits.view(softmax_logits.size()[:-1])
+            reshaped_logits  = sampled_logits.reshape(softmax_logits.size()[:-1])
             return reshaped_logits
 
-class VanillaD3MScheduler(D3MScheduler):
+class VanillaD3MSchedule(D3MSchedule):
 
     def __init__(self, num_inference_steps: int, argmax_posterior: bool):
         super().__init__()
@@ -59,12 +59,12 @@ class VanillaD3MScheduler(D3MScheduler):
 
         return new_action_tokens, t + 1 / self.num_inference_steps
 
-class TwoBlockD3MScheduler(D3MScheduler):
+class TwoBlockD3MSchedule(D3MSchedule):
 
     def __init__(self, num_inference_steps: int, argmax_posterior: bool):
         super().__init__()
         self.argmax_posterior    = argmax_posterior
-        assert num_inference_steps == 2, "TwoBlockD3MScheduler requires num_inference_steps == 2"
+        assert num_inference_steps == 2, "TwoBlockD3MSchedule requires num_inference_steps == 2"
 
     def noise_tokens(self, action_tokens, noise_tokens, t):
         """
@@ -104,7 +104,7 @@ class TwoBlockD3MScheduler(D3MScheduler):
         return new_action_tokens, new_t
 
 
-class GreedyD3MScheduler(D3MScheduler):
+class GreedyD3MSchedule(D3MSchedule):
     """
     This sampling strategy was explored in https://arxiv.org/abs/2502.06768
     """
@@ -155,29 +155,29 @@ class GreedyD3MScheduler(D3MScheduler):
         t = t + (1 / self.num_inference_steps)
         return new_action_tokens, t
 
-def get_scheduler(scheduler_name: str, num_inference_steps: int, pad_token_id: int, **kwargs) -> D3MScheduler:
-    if scheduler_name == "vanilla":
-        return VanillaD3MScheduler(
+def get_schedule(schedule_name: str, num_inference_steps: int, pad_token_id: int, **kwargs) -> D3MSchedule:
+    if schedule_name == "vanilla":
+        return VanillaD3MSchedule(
             num_inference_steps,
             False
         )
-    elif scheduler_name == "vanilla-argmax":
-        return VanillaD3MScheduler(
+    elif schedule_name == "vanilla-argmax":
+        return VanillaD3MSchedule(
             num_inference_steps,
             True
         )
-    elif scheduler_name == "greedy":
-        return GreedyD3MScheduler(
+    elif schedule_name == "greedy":
+        return GreedyD3MSchedule(
             num_inference_steps, 
             pad_token_id
         )
-    elif scheduler_name == "TwoBlockD3M":
-        return TwoBlockD3MScheduler(
+    elif schedule_name == "TwoBlockD3M":
+        return TwoBlockD3MSchedule(
             num_inference_steps,
             False
         )
     else:
-        raise KeyError(f"Scheduler name '{scheduler_name}' not found.")
+        raise KeyError(f"Schedule name '{schedule_name}' not found.")
 
 
 
