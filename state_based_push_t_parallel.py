@@ -835,35 +835,24 @@ class StateBasedDiffusionPolicy(nn.Module):
 
 class StateBasedDiscreteDiffusionPolicy(nn.Module):
     
-    def __init__(self, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, mode="standard"):
+    def __init__(self, action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, scheduler):
         super().__init__()
-
-        self.mode = mode
-        assert (mode != "one_shot" or num_diffusion_iters == 1)
         
+        self.num_timesteps = num_diffusion_iters
+        self.scheduler = scheduler
+
         self.noise_pred_net = ConditionalUnet1D(
             input_dim=embed_dim,
             global_cond_dim=obs_dim*obs_horizon
         )
 
-        self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=num_diffusion_iters,
-            # the choise of beta schedule has big impact on performance
-            # we found squared cosine works the best
-            beta_schedule='squaredcos_cap_v2',
-            # clip output to [-1,1] to improve stability
-            clip_sample=True,
-            # our network predicts noise (instead of denoised action)
-            prediction_type='epsilon'
-        )
-
         # initialize tokenizer
         from tokenization import BinningActionTokenizer
         self.tokenizer = BinningActionTokenizer(
-            max_action_dim=2,
+            max_action_dim=action_dim,
             action_chunk_size=16,
-            vocab_size=512,
-            contiguous_dimensions=True
+            vocab_size=vocab_size,
+            contiguous_dimensions=False
         )
 
         # initialize embedding
@@ -871,10 +860,6 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
 
     @staticmethod
     def sample_categorical(probs):
-        """
-        probs: (..., K) probability tensor, sums to 1 on last dim.
-        returns: indices (...,) sampled
-        """
         shape = probs.shape[:-1]
         probs_flat = probs.reshape(-1, probs.shape[-1])
         samples = torch.multinomial(probs_flat, num_samples=1)  # (N, 1)
@@ -889,34 +874,17 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
         obs_cond = obs_cond.flatten(start_dim=1)
 
         naction = self.tokenizer.tokenize(naction)
+        noise = torch.full_like(naction, 0, dtype=torch.long, device=device)
 
-        if self.mode == "standard":
-            # sample a diffusion iteration for each data point
-            timesteps = torch.randint(
-                0, self.noise_scheduler.config.num_train_timesteps,
-                (B,), device=device
-            ).long()
+        timesteps = torch.randint(
+            0, self.num_timesteps,
+            (B,), device=device
+        ).long()
 
-            # noise = torch.empty_like(naction, device=device)
-            # for i in range(B):
-            #     ti = int(timesteps[i].item())
-            #     Qt = self.Q_prod[ti-1]   # (K,K): rows x0, cols current xt
-            #     # probabilities for each position: p(xt | x0) = one_hot(x0) @ Qt
-            #     # one_hot(x0) shape (H, K) -> multiply with Qt -> (H, K)
-            #     one_hot_x0 = F.one_hot(naction[i].to(device), num_classes=K).float()  # (H, K)
-            #     p_xt = one_hot_x0 @ Qt  # (H, K)
-            #     # sample categorical per position
-            #     noise[i] = self.sample_categorical(p_xt)
+        noisy_actions = self.scheduler.noise_tokens(
+            naction, noise, 1 - (timesteps / self.num_timesteps))
 
-            raise NotImplementedError("standard forward not implemented yet")
-
-        elif self.mode == "one_shot":
-            noise = torch.full_like(naction, 0, dtype=torch.long, device=device)
-            timesteps = torch.full((B,), self.noise_scheduler.config.num_train_timesteps, device=device).long()
-        else:
-            raise ValueError("mode must be 'standard' or 'one_shot'")
-
-        noise_emb = self.token_embedding(noise)
+        noise_emb = self.token_embedding(noisy_actions)
         noise_emb_pred = self.noise_pred_net(noise_emb, timesteps, global_cond=obs_cond)
         noise_pred = (self.token_embedding.weight @ noise_emb_pred.transpose(1, 2)).transpose(1, 2)
 
@@ -929,29 +897,15 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
 
         # Generate an action sequence for each obs
         with torch.no_grad():
-            noisy_action = torch.full((B, pred_horizon*2), 0, device=device)
+            noisy_action = torch.full((B, pred_horizon * self.action_dim), 0, device=device)
             naction = noisy_action
 
-            if self.mode == "standard":
-                raise NotImplementedError("standard sample not implemented yet")
-
-                self.noise_scheduler.set_timesteps(self.noise_scheduler.config.num_train_timesteps)
-                for k in self.noise_scheduler.timesteps:
-                    naction_emb = self.token_embedding(naction)
-                    noise_pred = self.noise_pred_net(naction_emb, k, global_cond=obs_cond)
-                    naction = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction_emb).prev_sample
-                    naction = torch.softmax(naction_emb, dim=-1)
-
-            elif self.mode == "one_shot":
+            for k  in self.num_timesteps:
                 naction_emb = self.token_embedding(naction)
-                noise_emb_pred = self.noise_pred_net(naction_emb, self.noise_scheduler.config.num_train_timesteps, global_cond=obs_cond)
+                noise_emb_pred = self.noise_pred_net(naction_emb, k, global_cond=obs_cond)
                 noise_pred = (self.token_embedding.weight @ noise_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
 
-                probs = torch.softmax(noise_pred, dim=-1).detach()
-                naction = self.sample_categorical(probs)
-
-            else:
-                raise ValueError("mode must be 'standard' or 'one_shot'")
+                naction = self.scheduler.step(naction, noise_pred, (1 - k / self.num_timesteps))
 
         naction = self.tokenizer.detokenize(naction)
         return naction
@@ -997,8 +951,8 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
         obs_cond = obs_cond.flatten(start_dim=1)
 
         naction = self.tokenizer.tokenize(naction)
-
         noise = torch.full_like(naction, 0, dtype=torch.long, device=device)
+
         timesteps = torch.full((B,), self.num_timesteps, device=device).long()
 
         noise_emb = self.token_embedding(noise)
@@ -1035,8 +989,14 @@ obs_dim = 5
 action_dim = 2
 num_diffusion_iters = 100
 
+vocab_size = 256
+embed_dim = 256
+from scheduler import VanillaD3MScheduler
+scheduler = VanillaD3MScheduler(num_diffusion_iters, False)
+
 # policy = StateBasedDiffusionPolicy(action_dim, obs_dim, obs_horizon, num_diffusion_iters)
-policy = SingleStepStateBasedDiscreteDiffusionPolicy(action_dim, 20, 256, obs_dim, obs_horizon)
+policy = StateBasedDiscreteDiffusionPolicy(action_dim, 256, 256, obs_dim, obs_horizon, num_diffusion_iters, scheduler)
+# policy = SingleStepStateBasedDiscreteDiffusionPolicy(action_dim, 256, 256, obs_dim, obs_horizon)
 
 # # example inputs
 # noised_action = torch.randn((1, pred_horizon, action_dim))
