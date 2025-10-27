@@ -293,34 +293,36 @@ def evaluate_policy_vectorized(
         "successes": successes,
     }
 
+def env_demo():
+    # from huggingface_hub.utils import IGNORE_GIT_FOLDER_PATTERNS
+    #@markdown ### **Env Demo**
+    #@markdown Standard Gym Env (0.21.0 API)
 
-# from huggingface_hub.utils import IGNORE_GIT_FOLDER_PATTERNS
-#@markdown ### **Env Demo**
-#@markdown Standard Gym Env (0.21.0 API)
+    # 0. create env object
+    env = PushTEnvAPI()
 
-# 0. create env object
-env = PushTEnvAPI()
+    # 1. seed env for initial state.
+    # Seed 0-200 are used for the demonstration dataset.
+    env.seed(1000)
 
-# 1. seed env for initial state.
-# Seed 0-200 are used for the demonstration dataset.
-env.seed(1000)
+    # 2. must reset before use
+    # obs, IGNORE_GIT_FOLDER_PATTERNS = env.reset()
+    obs, _ = env.reset()
 
-# 2. must reset before use
-# obs, IGNORE_GIT_FOLDER_PATTERNS = env.reset()
-obs, _ = env.reset()
+    # 3. 2D positional action space [0,512]
+    action = env.action_space.sample()
 
-# 3. 2D positional action space [0,512]
-action = env.action_space.sample()
+    # 4. Standard gym step method
+    obs, reward, terminated, truncated, info = env.step(action)
 
-# 4. Standard gym step method
-obs, reward, terminated, truncated, info = env.step(action)
-
-# prints and explains each dimension of the observation and action vectors
-with np.printoptions(precision=4, suppress=True, threshold=5):
-    print("Obs: ", repr(obs))
-    print("Obs:        [agent_x,  agent_y,  block_x,  block_y,    block_angle]")
-    print("Action: ", repr(action))
-    print("Action:   [target_agent_x, target_agent_y]")
+    # prints and explains each dimension of the observation and action vectors
+    with np.printoptions(precision=4, suppress=True, threshold=5):
+        print("Obs: ", repr(obs))
+        print("Obs:        [agent_x,  agent_y,  block_x,  block_y,    block_angle]")
+        print("Action: ", repr(action))
+        print("Action:   [target_agent_x, target_agent_y]")
+    
+    return env
 
 #@markdown ### **Dataset**
 #@markdown
@@ -468,48 +470,48 @@ class PushTStateDataset(torch.utils.data.Dataset):
         nsample['obs'] = nsample['obs'][:self.obs_horizon,:]
         return nsample
 
-#@markdown ### **Dataset Demo**
+def dataset_demo(pred_horizon=16, obs_horizon=2, action_horizon=8, batch_size=256):
+    #@markdown ### **Dataset Demo**
 
-# download demonstration data from Google Drive
-dataset_path = "pusht_cchi_v7_replay.zarr.zip"
-if not os.path.isfile(dataset_path):
-    id = "1KY1InLurpMvJDRb14L9NlXT_fEsCvVUq&confirm=t"
-    gdown.download(id=id, output=dataset_path, quiet=False)
+    # download demonstration data from Google Drive
+    dataset_path = "pusht_cchi_v7_replay.zarr.zip"
+    if not os.path.isfile(dataset_path):
+        id = "1KY1InLurpMvJDRb14L9NlXT_fEsCvVUq&confirm=t"
+        gdown.download(id=id, output=dataset_path, quiet=False)
 
-# parameters
-pred_horizon = 16
-obs_horizon = 2
-action_horizon = 8
-#|o|o|                             observations: 2
-#| |a|a|a|a|a|a|a|a|               actions executed: 8
-#|p|p|p|p|p|p|p|p|p|p|p|p|p|p|p|p| actions predicted: 16
+    # parameters
+    #|o|o|                             observations: 2
+    #| |a|a|a|a|a|a|a|a|               actions executed: 8
+    #|p|p|p|p|p|p|p|p|p|p|p|p|p|p|p|p| actions predicted: 16
 
-# create dataset from file
-dataset = PushTStateDataset(
-    dataset_path=dataset_path,
-    pred_horizon=pred_horizon,
-    obs_horizon=obs_horizon,
-    action_horizon=action_horizon
-)
-# save training data statistics (min, max) for each dim
-stats = dataset.stats
+    # create dataset from file
+    dataset = PushTStateDataset(
+        dataset_path=dataset_path,
+        pred_horizon=pred_horizon,
+        obs_horizon=obs_horizon,
+        action_horizon=action_horizon
+    )
+    # save training data statistics (min, max) for each dim
+    stats = dataset.stats
 
-# create dataloader
-dataloader = torch.utils.data.DataLoader(
-    dataset,
-    batch_size=256,
-    num_workers=1,
-    shuffle=True,
-    # accelerate cpu-gpu transfer
-    pin_memory=True,
-    # don't kill worker process afte each epoch
-    persistent_workers=True
-)
+    # create dataloader
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=1,
+        shuffle=True,
+        # accelerate cpu-gpu transfer
+        pin_memory=True,
+        # don't kill worker process afte each epoch
+        persistent_workers=True
+    )
 
-# visualize data in batch
-batch = next(iter(dataloader))
-print("batch['obs'].shape:", batch['obs'].shape)
-print("batch['action'].shape", batch['action'].shape)
+    # visualize data in batch
+    batch = next(iter(dataloader))
+    print("batch['obs'].shape:", batch['obs'].shape)
+    print("batch['action'].shape", batch['action'].shape)
+
+    return dataloader, stats
 
 
 #@markdown ### **Network**
@@ -905,7 +907,7 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
 
 class StateBasedDiscreteDiffusionPolicy(nn.Module):
     
-    def __init__(self, action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, schedule_name):
+    def __init__(self, action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, tokenizer_name, schedule_name):
         super().__init__()
         
         self.num_timesteps = num_diffusion_iters
@@ -917,12 +919,12 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
         )
 
         # initialize tokenizer
-        from tokenization import BinningActionTokenizer
-        self.tokenizer = BinningActionTokenizer(
+        from tokenization import get_tokenizer
+        self.tokenizer = get_tokenizer(
+            tokenizer_name=tokenizer_name,
+            vocab_size=vocab_size,
             max_action_dim=action_dim,
             action_chunk_size=16,
-            vocab_size=vocab_size,
-            contiguous_dimensions=False
         )
 
         # initialize embedding
@@ -996,260 +998,312 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
         naction = self.tokenizer.detokenize(naction)
         return naction
             
+def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, embed_dim, schedule_name, obs_horizon=2):
+    #@markdown ### **Network Demo**
 
-#@markdown ### **Network Demo**
+    # observation and action dimensions corrsponding to
+    # the output of PushTEnv
+    obs_dim = 5
+    action_dim = 2
+    # num_diffusion_iters = 20
 
-# observation and action dimensions corrsponding to
-# the output of PushTEnv
-obs_dim = 5
-action_dim = 2
-num_diffusion_iters = 20
+    # vocab_size = 20
+    # embed_dim = 256
+    # schedule_name = "vanilla"
 
-vocab_size = 20
-embed_dim = 256
-schedule_name = "vanilla"
+    if policy_name == "continuous":
+        policy = StateBasedDiffusionPolicy(action_dim, obs_dim, obs_horizon, num_diffusion_iters)
+    elif policy_name == "discrete_singlestep":
+        policy = SingleStepStateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, tokenizer_name)
+    elif policy_name == "discrete":
+        policy = StateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, tokenizer_name, schedule_name)
+    else:
+        raise ValueError("invalid policy name")
+    
+    # policy = StateBasedDiffusionPolicy(action_dim, obs_dim, obs_horizon, num_diffusion_iters)
+    # policy = SingleStepStateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon)
+    # policy = StateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, schedule_name)
 
-# policy = StateBasedDiffusionPolicy(action_dim, obs_dim, obs_horizon, num_diffusion_iters)
-# policy = SingleStepStateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon)
-policy = StateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, schedule_name)
+    # # example inputs
+    # noised_action = torch.randn((1, pred_horizon, action_dim))
+    # obs = torch.zeros((1, obs_horizon, obs_dim))
+    # diffusion_iter = torch.zeros((1,))
 
-# # example inputs
-# noised_action = torch.randn((1, pred_horizon, action_dim))
-# obs = torch.zeros((1, obs_horizon, obs_dim))
-# diffusion_iter = torch.zeros((1,))
+    # # the noise prediction network
+    # # takes noisy action, diffusion iteration and observation as input
+    # # predicts the noise added to action
+    # noise = policy.noise_pred_net(
+    #     sample=noised_action,
+    #     timestep=diffusion_iter,
+    #     global_cond=obs.flatten(start_dim=1))
 
-# # the noise prediction network
-# # takes noisy action, diffusion iteration and observation as input
-# # predicts the noise added to action
-# noise = policy.noise_pred_net(
-#     sample=noised_action,
-#     timestep=diffusion_iter,
-#     global_cond=obs.flatten(start_dim=1))
+    # # illustration of removing noise
+    # # the actual noise removal is performed by NoiseScheduler
+    # # and is dependent on the diffusion noise schedule
+    # denoised_action = noised_action - noise
 
-# # illustration of removing noise
-# # the actual noise removal is performed by NoiseScheduler
-# # and is dependent on the diffusion noise schedule
-# denoised_action = noised_action - noise
+    return policy
 
 
-# device transfer
-device = torch.device('cuda')
-policy = policy.to(device)
+def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_horizon=16, obs_horizon=2, action_horizon=8):
+    # device transfer
+    device = torch.device('cuda')
+    policy = policy.to(device)
 
-#@markdown ### **Training**
-#@markdown
-#@markdown Takes about an hour. If you don't want to wait, skip to the next cell
-#@markdown to load pre-trained weights
+    #@markdown ### **Training**
+    #@markdown
+    #@markdown Takes about an hour. If you don't want to wait, skip to the next cell
+    #@markdown to load pre-trained weights
 
-# Initialize logger with wandb enabled for KitchenSink project
-logger = CustomSingletonLogger(use_wandb=True)
+    # Initialize logger with wandb enabled for KitchenSink project
+    logger = CustomSingletonLogger(use_wandb=True)
 
-num_epochs = 200
+    # num_epochs = 200
 
-# Exponential Moving Average
-# accelerates training and improves stability
-# holds a copy of the model weights
-ema = EMAModel(
-    parameters=policy.parameters(),
-    power=0.75)
+    # Exponential Moving Average
+    # accelerates training and improves stability
+    # holds a copy of the model weights
+    ema = EMAModel(
+        parameters=policy.parameters(),
+        power=0.75)
 
-# Standard ADAM optimizer
-# Note that EMA parametesr are not optimized
-optimizer = torch.optim.AdamW(
-    params=policy.parameters(),
-    lr=1e-4, weight_decay=1e-6)
+    # Standard ADAM optimizer
+    # Note that EMA parametesr are not optimized
+    optimizer = torch.optim.AdamW(
+        params=policy.parameters(),
+        lr=1e-4, weight_decay=1e-6)
 
-# Cosine LR schedule with linear warmup
-lr_scheduler = get_scheduler(
-    name='cosine',
-    optimizer=optimizer,
-    num_warmup_steps=500,
-    num_training_steps=len(dataloader) * num_epochs
-)
+    # Cosine LR schedule with linear warmup
+    lr_scheduler = get_scheduler(
+        name='cosine',
+        optimizer=optimizer,
+        num_warmup_steps=500,
+        num_training_steps=len(dataloader) * num_epochs
+    )
 
-# Initialize global step counter for logging
-global_step = 0
-logger.set_global_step(global_step)
+    # Initialize global step counter for logging
+    global_step = 0
+    logger.set_global_step(global_step)
 
-with tqdm(range(num_epochs), desc='Epoch') as tglobal:
-    # epoch loop
-    for epoch_idx in tglobal:
-        epoch_loss = list()
-        # batch loop
-        with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
-            for nbatch in tepoch:
-                # data normalized in dataset
-                # device transfer
-                nobs = nbatch['obs'].to(device)
-                naction = nbatch['action'].to(device)
-                B = nobs.shape[0]
-                
-                # (B, obs_horizon, obs_dim)
-                nobs = nobs[:,:obs_horizon,:]
-                loss = policy.forward(nobs, naction, device)
-
-                # optimize
-                loss.backward()
-                optimizer.step()
-                optimizer.zero_grad()
-                # step lr scheduler every batch
-                # this is different from standard pytorch behavior
-                lr_scheduler.step()
-
-                # update Exponential Moving Average of the model weights
-                ema.step(policy.parameters())
-
-                # logging
-                loss_cpu = loss.item()
-                epoch_loss.append(loss_cpu)
-                tepoch.set_postfix(loss=loss_cpu)
-                
-                # Log train loss to wandb KitchenSink
-                logger.log_to_wandb_for_current_step({"train_loss": loss_cpu})
-                
-                # Update global step for next iteration
-                global_step += 1
-                logger.set_global_step(global_step)
-        tglobal.set_postfix(loss=np.mean(epoch_loss))
-
-        if epoch_idx % 10 == 0:
-            
-            # Weights of the EMA model
-            # is used for inference
-            ema_policy = policy
-            ema.copy_to(policy.parameters())
-
-            #@markdown ### **Loading Pretrained Checkpoint**
-            #@markdown Set `load_pretrained = True` to load pretrained weights.
-
-            load_pretrained = False
-            if load_pretrained:
-                ckpt_path = "pusht_state_100ep.ckpt"
-                if not os.path.isfile(ckpt_path):
-                    id = "1mHDr_DEZSdiGo9yecL50BBQYzR8Fjhl_&confirm=t"
-                    gdown.download(id=id, output=ckpt_path, quiet=False)
-
-                state_dict = torch.load(ckpt_path, map_location='cuda', weights_only=True)
-                ema_policy = policy
-                ema_policy.noise_pred_net.load_state_dict(state_dict)
-                print('Pretrained weights loaded.')
-            else:
-                print("Skipped pretrained weight loading.")
-
-            # Vectorized evaluation every 10 epochs (no rendering, fast)
-            import time
-            n_envs = 16
-            seeds = np.arange(100000, 100000 + n_envs)  # or any list of length n_envs
-
-            start_time = time.time()
-            metrics = evaluate_policy_vectorized(
-                make_env_fn=partial(PushTEnvAPI, render_size=96),
-                n_envs=n_envs,
-                seeds=seeds,
-                max_steps=200,
-                obs_horizon=obs_horizon,
-                pred_horizon=pred_horizon,
-                action_horizon=action_horizon,
-                stats=stats,
-                device=device,
-                policy=policy
-            )
-            elapsed_time = time.time() - start_time
-
-            print(f"[Vector Eval] n_envs={n_envs}  success_rate={metrics['success_rate']:.3f}  avg_return={metrics['avg_return']:.2f}")
-            print(f"[Vector Eval] Time elapsed: {elapsed_time:.2f} seconds")
-
-            # Optional: log to wandb
-            logger.log_to_wandb_for_current_step({
-                "vector_success_rate": metrics["success_rate"],
-                "vector_avg_return": metrics["avg_return"],
-                "vector_eval_time_sec": elapsed_time,
-            })
-
-            #@markdown ### **Inference**
-
-            # limit enviornment interaction to 200 steps before termination
-            max_steps = 200
-            env = PushTEnvAPI(render_mode="rgb_array")
-            # use a seed >200 to avoid initial states seen in the training dataset
-            env.seed(100000)
-
-            # get first observation
-            obs, info = env.reset()
-
-            # keep a queue of last 2 steps of observations
-            obs_deque = collections.deque(
-                [obs] * obs_horizon, maxlen=obs_horizon)
-            # save visualization and rewards
-            imgs = [env.render(mode='rgb_array')]
-            rewards = list()
-            done = False
-            step_idx = 0
-
-            with tqdm(total=max_steps, desc="Eval PushTStateEnv") as pbar:
-                while not done:
-                    B = 1
-                    # stack the last obs_horizon (2) number of observations
-                    obs_seq = np.stack(obs_deque)
-                    # normalize observation
-                    nobs = normalize_data(obs_seq, stats=stats['obs'])
+    with tqdm(range(num_epochs), desc='Epoch') as tglobal:
+        # epoch loop
+        for epoch_idx in tglobal:
+            epoch_loss = list()
+            # batch loop
+            with tqdm(dataloader, desc='Batch', leave=False) as tepoch:
+                for nbatch in tepoch:
+                    # data normalized in dataset
                     # device transfer
-                    nobs = torch.from_numpy(nobs).to(device, dtype=torch.float32)
+                    nobs = nbatch['obs'].to(device)
+                    naction = nbatch['action'].to(device)
+                    B = nobs.shape[0]
+                    
+                    # (B, obs_horizon, obs_dim)
+                    nobs = nobs[:,:obs_horizon,:]
+                    loss = policy.forward(nobs, naction, device)
 
-                    # Batch into singleton batch before passing to policy
-                    naction = policy.sample(nobs.unsqueeze(0), pred_horizon, device)
+                    # optimize
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    # step lr scheduler every batch
+                    # this is different from standard pytorch behavior
+                    lr_scheduler.step()
 
-                    # unnormalize action
-                    naction = naction.detach().to('cpu').numpy()
-                    # (B, pred_horizon, action_dim)
-                    naction = naction[0]
-                    action_pred = unnormalize_data(naction, stats=stats['action'])
+                    # update Exponential Moving Average of the model weights
+                    ema.step(policy.parameters())
 
-                    # only take action_horizon number of actions
-                    start = obs_horizon - 1
-                    end = start + action_horizon
-                    action = action_pred[start:end,:]
-                    # (action_horizon, action_dim)
+                    # logging
+                    loss_cpu = loss.item()
+                    epoch_loss.append(loss_cpu)
+                    tepoch.set_postfix(loss=loss_cpu)
+                    
+                    # Log train loss to wandb KitchenSink
+                    logger.log_to_wandb_for_current_step({"train_loss": loss_cpu})
+                    
+                    # Update global step for next iteration
+                    global_step += 1
+                    logger.set_global_step(global_step)
+            tglobal.set_postfix(loss=np.mean(epoch_loss))
 
-                    # execute action_horizon number of steps
-                    # without replanning
-                    for i in range(len(action)):
-                        # stepping env
-                        obs, reward, done, _, info = env.step(action[i])
-                        # save observations
-                        obs_deque.append(obs)
-                        # and reward/vis
-                        rewards.append(reward)
-                        imgs.append(env.render(mode='rgb_array'))
+            if epoch_idx % 10 == 0:
+                
+                # Weights of the EMA model
+                # is used for inference
+                ema_policy = policy
+                ema.copy_to(policy.parameters())
 
-                        # update progress bar
-                        step_idx += 1
-                        pbar.update(1)
-                        pbar.set_postfix(reward=reward)
-                        if step_idx > max_steps:
-                            done = True
-                        if done:
-                            break
+                #@markdown ### **Loading Pretrained Checkpoint**
+                #@markdown Set `load_pretrained = True` to load pretrained weights.
+                if load_pretrained:
+                    ckpt_path = "pusht_state_100ep.ckpt"
+                    if not os.path.isfile(ckpt_path):
+                        id = "1mHDr_DEZSdiGo9yecL50BBQYzR8Fjhl_&confirm=t"
+                        gdown.download(id=id, output=ckpt_path, quiet=False)
 
-            # print out the maximum target coverage
-            print('Score: ', max(rewards))
+                    state_dict = torch.load(ckpt_path, map_location='cuda', weights_only=True)
+                    ema_policy = policy
+                    ema_policy.noise_pred_net.load_state_dict(state_dict)
+                    print('Pretrained weights loaded.')
+                else:
+                    print("Skipped pretrained weight loading.")
 
-            # visualize
-            from IPython.display import Video
-            import os
-            import wandb
+                # Vectorized evaluation every 10 epochs (no rendering, fast)
+                import time
+                n_envs = 16
+                seeds = np.arange(100000, 100000 + n_envs)  # or any list of length n_envs
 
-            # Create output directory if it doesn't exist
-            os.makedirs('out', exist_ok=True)
+                start_time = time.time()
+                metrics = evaluate_policy_vectorized(
+                    make_env_fn=partial(PushTEnvAPI, render_size=96),
+                    n_envs=n_envs,
+                    seeds=seeds,
+                    max_steps=200,
+                    obs_horizon=obs_horizon,
+                    pred_horizon=pred_horizon,
+                    action_horizon=action_horizon,
+                    stats=stats,
+                    device=device,
+                    policy=policy
+                )
+                elapsed_time = time.time() - start_time
 
-            # Save video to out directory
-            video_path = 'out/vis.mp4'
-            vwrite(video_path, imgs)
+                print(f"[Vector Eval] n_envs={n_envs}  success_rate={metrics['success_rate']:.3f}  avg_return={metrics['avg_return']:.2f}")
+                print(f"[Vector Eval] Time elapsed: {elapsed_time:.2f} seconds")
 
-            # Log video to wandb
-            logger.log_to_wandb_for_current_step({
-                "evaluation_video": wandb.Video(video_path, fps=10, format="mp4"),
-                "final_score": max(rewards)
-            })
+                # Optional: log to wandb
+                logger.log_to_wandb_for_current_step({
+                    "vector_success_rate": metrics["success_rate"],
+                    "vector_avg_return": metrics["avg_return"],
+                    "vector_eval_time_sec": elapsed_time,
+                })
 
-            Video(video_path, embed=True, width=256, height=256)
+                #@markdown ### **Inference**
+
+                # limit enviornment interaction to 200 steps before termination
+                max_steps = 200
+                env = PushTEnvAPI(render_mode="rgb_array")
+                # use a seed >200 to avoid initial states seen in the training dataset
+                env.seed(100000)
+
+                # get first observation
+                obs, info = env.reset()
+
+                # keep a queue of last 2 steps of observations
+                obs_deque = collections.deque(
+                    [obs] * obs_horizon, maxlen=obs_horizon)
+                # save visualization and rewards
+                imgs = [env.render(mode='rgb_array')]
+                rewards = list()
+                done = False
+                step_idx = 0
+
+                with tqdm(total=max_steps, desc="Eval PushTStateEnv") as pbar:
+                    while not done:
+                        B = 1
+                        # stack the last obs_horizon (2) number of observations
+                        obs_seq = np.stack(obs_deque)
+                        # normalize observation
+                        nobs = normalize_data(obs_seq, stats=stats['obs'])
+                        # device transfer
+                        nobs = torch.from_numpy(nobs).to(device, dtype=torch.float32)
+
+                        # Batch into singleton batch before passing to policy
+                        naction = policy.sample(nobs.unsqueeze(0), pred_horizon, device)
+
+                        # unnormalize action
+                        naction = naction.detach().to('cpu').numpy()
+                        # (B, pred_horizon, action_dim)
+                        naction = naction[0]
+                        action_pred = unnormalize_data(naction, stats=stats['action'])
+
+                        # only take action_horizon number of actions
+                        start = obs_horizon - 1
+                        end = start + action_horizon
+                        action = action_pred[start:end,:]
+                        # (action_horizon, action_dim)
+
+                        # execute action_horizon number of steps
+                        # without replanning
+                        for i in range(len(action)):
+                            # stepping env
+                            obs, reward, done, _, info = env.step(action[i])
+                            # save observations
+                            obs_deque.append(obs)
+                            # and reward/vis
+                            rewards.append(reward)
+                            imgs.append(env.render(mode='rgb_array'))
+
+                            # update progress bar
+                            step_idx += 1
+                            pbar.update(1)
+                            pbar.set_postfix(reward=reward)
+                            if step_idx > max_steps:
+                                done = True
+                            if done:
+                                break
+
+                # print out the maximum target coverage
+                print('Score: ', max(rewards))
+
+                # visualize
+                from IPython.display import Video
+                import os
+                import wandb
+
+                # Create output directory if it doesn't exist
+                os.makedirs('out', exist_ok=True)
+
+                # Save video to out directory
+                video_path = 'out/vis.mp4'
+                vwrite(video_path, imgs)
+
+                # Log video to wandb
+                logger.log_to_wandb_for_current_step({
+                    "evaluation_video": wandb.Video(video_path, fps=10, format="mp4"),
+                    "final_score": max(rewards)
+                })
+
+                Video(video_path, embed=True, width=256, height=256)
+
+
+import argparse
+def main():
+    # Create the argument parser
+    parser = argparse.ArgumentParser()
+
+    # Script mode
+    parser.add_argument("--mode", type=str, default="train", help="script mode [train]")
+
+    # Training args
+    parser.add_argument("--num_epochs", type=int, default=10, help="num training epochs")
+    parser.add_argument("--load_pretrained", type=bool, default=False, help="load pretrained weights")
+
+    # Dataset args
+    parser.add_argument("--pred_horizon", type=int, default=16, help="num of predicted actions")
+    parser.add_argument("--obs_horizon", type=int, default=2, help="num of conditioning observations")
+    parser.add_argument("--action_horizon", type=int, default=8, help="num of actual actions")
+    parser.add_argument("--batch_size", type=int, default=256, help="dataset batch size")
+
+    # Network args
+    parser.add_argument("--policy_name", type=str, default="continuous", help="name of diffusion policy model")
+    parser.add_argument("--num_diffusion_iters", type=int, default=100, help="num timesteps for diffusion model")
+    parser.add_argument("--tokenizer_name", type=str, default="binning", help="name of discrete diffusion tokenizer")
+    parser.add_argument("--vocab_size", type=int, default=10, help="vocab size of tokenizer (e.g. num of bins)")
+    parser.add_argument("--embed_dim", type=int, default=256, help="dimension of tokenizer embedding space")
+    parser.add_argument("--schedule_name", type=str, default="vanilla", help="name of diffusion schedule")
+
+    # Parse the arguments
+    args = parser.parse_args()
+
+    env = env_demo()
+    dataloader, stats = dataset_demo(args.pred_horizon, args.obs_horizon, args.action_horizon, args.batch_size)
+    policy = network_demo(args.policy_name, args.num_diffusion_iters, args.tokenizer_name, args.vocab_size, args.embed_dim, args.schedule_name, args.obs_horizon)
+
+    if args.mode == "train":
+        assert (args.policy_name == "continuous" or args.load_pretrained == False)
+        print(args.policy_name, args.num_diffusion_iters, args.num_epochs, args.vocab_size, args.schedule_name, args.batch_size)
+        train(policy, dataloader, stats, args.num_epochs, args.load_pretrained, args.pred_horizon, args.obs_horizon, args.action_horizon)
+
+if __name__ == "__main__":
+    main()
