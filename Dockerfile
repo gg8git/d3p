@@ -57,6 +57,7 @@ pygame \
 pymunk==6.11.1 \
 gym \
 gymnasium \
+gym-pusht \
 shapely \
 opencv-python \
 gdown
