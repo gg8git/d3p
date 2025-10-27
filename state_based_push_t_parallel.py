@@ -470,7 +470,7 @@ class PushTStateDataset(torch.utils.data.Dataset):
         nsample['obs'] = nsample['obs'][:self.obs_horizon,:]
         return nsample
 
-def dataset_demo(pred_horizon=16, obs_horizon=2, action_horizon=8, batch_size=256):
+def dataset_demo(batch_size=256, pred_horizon=16, obs_horizon=2, action_horizon=8):
     #@markdown ### **Dataset Demo**
 
     # download demonstration data from Google Drive
@@ -998,7 +998,7 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
         naction = self.tokenizer.detokenize(naction)
         return naction
             
-def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, embed_dim, schedule_name, obs_horizon=2):
+def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, embed_dim, schedule_name, pred_horizon=16, obs_horizon=2, action_horizon=6):
     #@markdown ### **Network Demo**
 
     # observation and action dimensions corrsponding to
@@ -1019,28 +1019,36 @@ def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, e
         policy = StateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, tokenizer_name, schedule_name)
     else:
         raise ValueError("invalid policy name")
-    
-    # policy = StateBasedDiffusionPolicy(action_dim, obs_dim, obs_horizon, num_diffusion_iters)
-    # policy = SingleStepStateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon)
-    # policy = StateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, schedule_name)
 
-    # # example inputs
-    # noised_action = torch.randn((1, pred_horizon, action_dim))
-    # obs = torch.zeros((1, obs_horizon, obs_dim))
-    # diffusion_iter = torch.zeros((1,))
+    # example inputs
+    noised_action = torch.randn((1, pred_horizon, action_dim))
+    noised_action = torch.clamp(noised_action, -1, 1)
+    obs = torch.zeros((1, obs_horizon, obs_dim))
 
-    # # the noise prediction network
-    # # takes noisy action, diffusion iteration and observation as input
-    # # predicts the noise added to action
-    # noise = policy.noise_pred_net(
-    #     sample=noised_action,
-    #     timestep=diffusion_iter,
-    #     global_cond=obs.flatten(start_dim=1))
+    policy.forward(obs, noised_action, obs.device)
+    policy.sample(obs, pred_horizon, obs.device)
 
-    # # illustration of removing noise
-    # # the actual noise removal is performed by NoiseScheduler
-    # # and is dependent on the diffusion noise schedule
-    # denoised_action = noised_action - noise
+    diffusion_iter = torch.zeros((1,))
+
+    if policy_name == "continuous":
+        pred_net = policy.noise_pred_net
+    elif policy_name == "discrete_singlestep" or policy_name == "discrete":
+        pred_net = policy.action_pred_net
+        noised_action = policy.tokenizer.tokenize(noised_action)
+        noised_action = policy.token_embedding(noised_action)
+
+    # the noise prediction network
+    # takes noisy action, diffusion iteration and observation as input
+    # predicts the noise added to action
+    noise = pred_net(
+        sample=noised_action,
+        timestep=diffusion_iter,
+        global_cond=obs.flatten(start_dim=1))
+
+    # illustration of removing noise
+    # the actual noise removal is performed by NoiseScheduler
+    # and is dependent on the diffusion noise schedule
+    denoised_action = noised_action - noise
 
     return policy
 
@@ -1297,8 +1305,8 @@ def main():
     args = parser.parse_args()
 
     env = env_demo()
-    dataloader, stats = dataset_demo(args.pred_horizon, args.obs_horizon, args.action_horizon, args.batch_size)
-    policy = network_demo(args.policy_name, args.num_diffusion_iters, args.tokenizer_name, args.vocab_size, args.embed_dim, args.schedule_name, args.obs_horizon)
+    dataloader, stats = dataset_demo(args.batch_size, args.pred_horizon, args.obs_horizon, args.action_horizon)
+    policy = network_demo(args.policy_name, args.num_diffusion_iters, args.tokenizer_name, args.vocab_size, args.embed_dim, args.schedule_name, args.pred_horizon, args.obs_horizon, args.action_horizon)
 
     if args.mode == "train":
         assert (args.policy_name == "continuous" or args.load_pretrained == False)
