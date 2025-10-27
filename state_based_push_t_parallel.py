@@ -32,7 +32,7 @@ from diffusers.optimization import get_scheduler
 from tqdm.auto import tqdm
 
 # logging import
-from log_utils import CustomSingletonLogger
+import wandb
 
 # env import
 import pygame
@@ -47,6 +47,7 @@ from skvideo.io import vwrite
 from IPython.display import Video
 import gdown
 import os
+from dotenv import load_dotenv
 
 import gymnasium as gym
 try:
@@ -1053,7 +1054,7 @@ def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, e
     return policy
 
 
-def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_horizon=16, obs_horizon=2, action_horizon=8):
+def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_horizon=16, obs_horizon=2, action_horizon=8, wandb_name="untitled_run"):
     # device transfer
     device = torch.device('cuda')
     policy = policy.to(device)
@@ -1063,8 +1064,24 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
     #@markdown Takes about an hour. If you don't want to wait, skip to the next cell
     #@markdown to load pre-trained weights
 
-    # Initialize logger with wandb enabled for KitchenSink project
-    logger = CustomSingletonLogger(use_wandb=True)
+    # Load WANDB_API_KEY from .train_env file
+    load_dotenv(dotenv_path='.train_env')
+    api_key = os.getenv("WANDB_API_KEY")
+    if api_key:
+        wandb.login(key=api_key)
+    
+    # Initialize wandb run
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    full_run_name = f"{wandb_name}_{timestamp}"
+    wandb_run = wandb.init(project="KitchenSink", name=full_run_name)
+    
+    # Log configuration
+    wandb.config.update({
+        "num_epochs": num_epochs,
+        "pred_horizon": pred_horizon,
+        "obs_horizon": obs_horizon,
+        "action_horizon": action_horizon,
+    })
 
     # num_epochs = 200
 
@@ -1091,7 +1108,6 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
 
     # Initialize global step counter for logging
     global_step = 0
-    logger.set_global_step(global_step)
 
     with tqdm(range(num_epochs), desc='Epoch') as tglobal:
         # epoch loop
@@ -1126,12 +1142,11 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
                     epoch_loss.append(loss_cpu)
                     tepoch.set_postfix(loss=loss_cpu)
                     
-                    # Log train loss to wandb KitchenSink
-                    logger.log_to_wandb_for_current_step({"train_loss": loss_cpu})
+                    # Log train loss to wandb
+                    wandb.log({"train_loss": loss_cpu}, step=global_step)
                     
                     # Update global step for next iteration
                     global_step += 1
-                    logger.set_global_step(global_step)
             tglobal.set_postfix(loss=np.mean(epoch_loss))
 
             if epoch_idx % 10 == 0:
@@ -1180,11 +1195,11 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
                 print(f"[Vector Eval] Time elapsed: {elapsed_time:.2f} seconds")
 
                 # Optional: log to wandb
-                logger.log_to_wandb_for_current_step({
+                wandb.log({
                     "vector_success_rate": metrics["success_rate"],
                     "vector_avg_return": metrics["avg_return"],
                     "vector_eval_time_sec": elapsed_time,
-                })
+                }, step=global_step)
 
                 #@markdown ### **Inference**
 
@@ -1254,11 +1269,6 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
                 # print out the maximum target coverage
                 print('Score: ', max(rewards))
 
-                # visualize
-                from IPython.display import Video
-                import os
-                import wandb
-
                 # Create output directory if it doesn't exist
                 os.makedirs('out', exist_ok=True)
 
@@ -1267,15 +1277,16 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
                 vwrite(video_path, imgs)
 
                 # Log video to wandb
-                logger.log_to_wandb_for_current_step({
+                wandb.log({
                     "evaluation_video": wandb.Video(video_path, fps=10, format="mp4"),
                     "final_score": max(rewards)
-                })
+                }, step=global_step)
 
                 Video(video_path, embed=True, width=256, height=256)
 
 
 import argparse
+from datetime import datetime
 def main():
     # Create the argument parser
     parser = argparse.ArgumentParser()
@@ -1300,6 +1311,9 @@ def main():
     parser.add_argument("--vocab_size", type=int, default=10, help="vocab size of tokenizer (e.g. num of bins)")
     parser.add_argument("--embed_dim", type=int, default=256, help="dimension of tokenizer embedding space")
     parser.add_argument("--schedule_name", type=str, default="vanilla", help="name of diffusion schedule")
+    
+    # Logging args
+    parser.add_argument("--wandb_name", type=str, default="untitled_run", help="name for wandb run")
 
     # Parse the arguments
     args = parser.parse_args()
@@ -1311,7 +1325,7 @@ def main():
     if args.mode == "train":
         assert (args.policy_name == "continuous" or args.load_pretrained == False)
         print(args.policy_name, args.num_diffusion_iters, args.num_epochs, args.vocab_size, args.schedule_name, args.batch_size)
-        train(policy, dataloader, stats, args.num_epochs, args.load_pretrained, args.pred_horizon, args.obs_horizon, args.action_horizon)
+        train(policy, dataloader, stats, args.num_epochs, args.load_pretrained, args.pred_horizon, args.obs_horizon, args.action_horizon, args.wandb_name)
 
 if __name__ == "__main__":
     main()

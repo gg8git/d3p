@@ -44,7 +44,8 @@ numpy \
 ipdb \
 wandb \
 matplotlib \
-scikit-learn
+scikit-learn \
+python-dotenv
 
 # some are pinned right now from importing the Push-T environment
 RUN pip install \
@@ -60,7 +61,8 @@ gymnasium \
 gym-pusht \
 shapely \
 opencv-python \
-gdown
+gdown \
+einops
 
 # used to link python as python3
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1
