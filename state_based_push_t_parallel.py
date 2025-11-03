@@ -775,7 +775,7 @@ class StateBasedDiffusionPolicy(nn.Module):
     def __init__(self, action_dim, obs_dim, obs_horizon, num_diffusion_iters):
         super().__init__()
         
-        self.noise_pred_net = ConditionalUnet1D(
+        self.pred_net = ConditionalUnet1D(
             input_dim=action_dim,
             global_cond_dim=obs_dim*obs_horizon
         )
@@ -814,12 +814,12 @@ class StateBasedDiffusionPolicy(nn.Module):
             naction, noise, timesteps)
 
         # predict the noise residual
-        noise_pred = self.noise_pred_net(
+        noise_pred = self.pred_net(
             noisy_actions, timesteps, global_cond=obs_cond)
 
         # L2 loss
         loss = nn.functional.mse_loss(noise_pred, noise)
-        return loss
+        return loss, noise_pred
 
     def sample(self, nobs_t, pred_horizon, device):
         B = nobs_t.shape[0]
@@ -831,7 +831,7 @@ class StateBasedDiffusionPolicy(nn.Module):
             naction = noisy_action
             self.noise_scheduler.set_timesteps(self.noise_scheduler.config.num_train_timesteps)
             for k in self.noise_scheduler.timesteps:
-                noise_pred = self.noise_pred_net(naction, k, global_cond=obs_cond)
+                noise_pred = self.pred_net(naction, k, global_cond=obs_cond)
                 naction = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
 
         return naction
@@ -844,7 +844,7 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
         self.num_timesteps = 1
         self.action_dim = action_dim
 
-        self.action_pred_net = ConditionalUnet1D(
+        self.pred_net = ConditionalUnet1D(
             input_dim=embed_dim,
             global_cond_dim=obs_dim*obs_horizon
         )
@@ -882,11 +882,11 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
         timesteps = torch.full((B,), self.num_timesteps, device=device).long()
 
         noise_emb = self.token_embedding(noise)
-        action_emb_pred = self.action_pred_net(noise_emb, timesteps, global_cond=obs_cond)
+        action_emb_pred = self.pred_net(noise_emb, timesteps, global_cond=obs_cond)
         action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)
 
         loss = torch.nn.functional.cross_entropy(action_pred.permute(0, 2, 1), naction)
-        return loss
+        return loss, action_pred
 
     def sample(self, nobs_t, pred_horizon, device):
         B = nobs_t.shape[0]
@@ -897,7 +897,7 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
             naction = torch.full((B, pred_horizon * self.action_dim), 0, device=device)
 
             naction_emb = self.token_embedding(naction)
-            action_emb_pred = self.action_pred_net(naction_emb, self.num_timesteps, global_cond=obs_cond)
+            action_emb_pred = self.pred_net(naction_emb, self.num_timesteps, global_cond=obs_cond)
             action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
 
             softmax_logits = torch.softmax(action_pred, dim=-1).detach()
@@ -914,7 +914,7 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
         self.num_timesteps = num_diffusion_iters
         self.action_dim = action_dim
 
-        self.action_pred_net = ConditionalUnet1D(
+        self.pred_net = ConditionalUnet1D(
             input_dim=embed_dim,
             global_cond_dim=obs_dim*obs_horizon
         )
@@ -962,11 +962,11 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
             naction, noise, 1 - (timesteps.float() / self.num_timesteps)) # 0 -> 1, self.num_timesteps -> 0
 
         noise_emb = self.token_embedding(noised_action)
-        action_emb_pred = self.action_pred_net(noise_emb, timesteps, global_cond=obs_cond)
+        action_emb_pred = self.pred_net(noise_emb, timesteps, global_cond=obs_cond)
         action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)
 
         loss = torch.nn.functional.cross_entropy(action_pred.permute(0, 2, 1), naction)
-        return loss
+        return loss, action_pred
 
     def sample(self, nobs_t, pred_horizon, device):
         B = nobs_t.shape[0]
@@ -980,7 +980,7 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
             timesteps = torch.arange(self.num_timesteps, 0, -1, device=device).long()
             for k in timesteps:
                 naction_emb = self.token_embedding(naction)
-                action_emb_pred = self.action_pred_net(naction_emb, k, global_cond=obs_cond)
+                action_emb_pred = self.pred_net(naction_emb, k, global_cond=obs_cond)
                 action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
 
                 softmax_logits = torch.softmax(action_pred, dim=-1).detach()
@@ -990,7 +990,7 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
             # k = self.num_timesteps
             # while k > 0:
             #     naction_emb = self.token_embedding(naction)
-            #     noise_emb_pred = self.noise_pred_net(naction_emb, k, global_cond=obs_cond)
+            #     noise_emb_pred = self.pred_net(naction_emb, k, global_cond=obs_cond)
             #     noise_pred = (self.token_embedding.weight @ noise_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
 
             #     naction, new_k = self.schedule.step(naction, noise_pred, (1 - k / self.num_timesteps)) # 0 -> 1, self.num_timesteps -> 0
@@ -1031,17 +1031,14 @@ def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, e
 
     diffusion_iter = torch.zeros((1,))
 
-    if policy_name == "continuous":
-        pred_net = policy.noise_pred_net
     elif policy_name == "discrete_singlestep" or policy_name == "discrete":
-        pred_net = policy.action_pred_net
         noised_action = policy.tokenizer.tokenize(noised_action)
         noised_action = policy.token_embedding(noised_action)
 
     # the noise prediction network
     # takes noisy action, diffusion iteration and observation as input
     # predicts the noise added to action
-    noise = pred_net(
+    noise = policy.pred_net(
         sample=noised_action,
         timestep=diffusion_iter,
         global_cond=obs.flatten(start_dim=1))
@@ -1109,6 +1106,10 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
     # Initialize global step counter for logging
     global_step = 0
 
+    # checkpointing info
+    top_checkpoints = []  # list of tuples (avg_return, path)
+    os.makedirs("checkpoints", exist_ok=True)
+
     with tqdm(range(num_epochs), desc='Epoch') as tglobal:
         # epoch loop
         for epoch_idx in tglobal:
@@ -1124,7 +1125,7 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
                     
                     # (B, obs_horizon, obs_dim)
                     nobs = nobs[:,:obs_horizon,:]
-                    loss = policy.forward(nobs, naction, device)
+                    loss, _ = policy.forward(nobs, naction, device)
 
                     # optimize
                     loss.backward()
@@ -1166,7 +1167,7 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
 
                     state_dict = torch.load(ckpt_path, map_location='cuda', weights_only=True)
                     ema_policy = policy
-                    ema_policy.noise_pred_net.load_state_dict(state_dict)
+                    ema_policy.pred_net.load_state_dict(state_dict)
                     print('Pretrained weights loaded.')
                 else:
                     print("Skipped pretrained weight loading.")
@@ -1200,6 +1201,40 @@ def train(policy, dataloader, stats, num_epochs, load_pretrained=False, pred_hor
                     "vector_avg_return": metrics["avg_return"],
                     "vector_eval_time_sec": elapsed_time,
                 }, step=global_step)
+
+                # Checkpointing logic
+                ckpt_path = f"checkpoints/epoch{epoch_idx:03d}_var{metrics['avg_return']:.3f}.pt"
+                save_dict = {
+                    "epoch": epoch_idx,
+                    "model_state": policy.state_dict(),
+                    "ema_state": [p.clone().detach().cpu() for p in policy.parameters()],
+                    "optimizer_state": optimizer.state_dict(),
+                    "success_rate": metrics["success_rate"],
+                    "avg_return": metrics["avg_return"],
+                }
+
+                # If top 3 not full or new best performance
+                if len(top_checkpoints) < 3 or metrics["avg_return"] > min(top_checkpoints, key=lambda x: x[0])[0]:
+                    torch.save(save_dict, ckpt_path)
+                    top_checkpoints.append((metrics["avg_return"], ckpt_path))
+                    top_checkpoints = sorted(top_checkpoints, key=lambda x: x[0], reverse=True)
+
+                    # Remove extra checkpoints beyond top 3
+                    while len(top_checkpoints) > 3:
+                        worst_ckpt = top_checkpoints.pop(-1)
+                        if os.path.exists(worst_ckpt[1]):
+                            os.remove(worst_ckpt[1])
+
+                    print(f"✅ Saved checkpoint: {ckpt_path}")
+                    print("Top checkpoints:")
+                    for rank, (avg_return, path) in enumerate(top_checkpoints, 1):
+                        print(f"  {rank}. {path} (AvgReturn={avg_return:.3f})")
+
+                    wandb.log({
+                        "best_vector_avg_return": top_checkpoints[0][0],
+                        "top_checkpoints": [os.path.basename(p) for _, p in top_checkpoints],
+                    }, step=global_step)
+                # ------------------------------
 
                 #@markdown ### **Inference**
 

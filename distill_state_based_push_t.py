@@ -795,29 +795,13 @@ UNET_CONFIGS = {
 
 class StateBasedDiffusionPolicy(nn.Module):
 
-    def __init__(self, action_dim, obs_dim, obs_horizon, num_diffusion_iters, unet_config=None):
+    def __init__(self, action_dim, obs_dim, obs_horizon, num_diffusion_iters):
         super().__init__()
         
-        if unet_config is not None:
-            self.noise_pred_net = ConditionalUnet1D(
-                input_dim=action_dim,
-                global_cond_dim=obs_dim*obs_horizon,
-                down_dims=unet_config["down_dims"],
-                diffusion_step_embed_dim=unet_config["diffusion_step_embed_dim"],
-            )
-
-            if unet_config["mid_modules"] != 2:
-                self.noise_pred_net.mid_modules = nn.ModuleList([
-                    ConditionalResidualBlock1D(
-                        unet_config["down_dims"][-1], unet_config["down_dims"][-1],
-                        cond_dim=unet_config["diffusion_step_embed_dim"] + obs_dim*obs_horizon
-                    ) for _ in range(unet_config["mid_modules"])
-                ])
-        else:
-            self.noise_pred_net = ConditionalUnet1D(
-                input_dim=action_dim,
-                global_cond_dim=obs_dim*obs_horizon
-            )
+        self.pred_net = ConditionalUnet1D(
+            input_dim=action_dim,
+            global_cond_dim=obs_dim*obs_horizon
+        )
 
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=num_diffusion_iters,
@@ -830,7 +814,7 @@ class StateBasedDiffusionPolicy(nn.Module):
             prediction_type='epsilon'
         )
 
-    def forward(self, nobs, naction, device, teacher=None):
+    def forward(self, nobs, naction, device):
         B = nobs.shape[0]
 
         # observation as FiLM conditioning
@@ -853,20 +837,12 @@ class StateBasedDiffusionPolicy(nn.Module):
             naction, noise, timesteps)
 
         # predict the noise residual
-        noise_pred = self.noise_pred_net(
+        noise_pred = self.pred_net(
             noisy_actions, timesteps, global_cond=obs_cond)
 
         # L2 loss
         loss = nn.functional.mse_loss(noise_pred, noise)
-        if teacher is None:
-            return loss
-        
-        with torch.no_grad():
-            noise_pred_teacher = teacher.noise_pred_net(
-                noisy_actions, timesteps, global_cond=obs_cond)
-
-        loss_teacher = nn.functional.mse_loss(noise_pred, noise_pred_teacher)
-        return 0.9 * loss + 0.1 * loss_teacher
+        return loss, noise_pred
 
     def sample(self, nobs_t, pred_horizon, device):
         B = nobs_t.shape[0]
@@ -878,7 +854,7 @@ class StateBasedDiffusionPolicy(nn.Module):
             naction = noisy_action
             self.noise_scheduler.set_timesteps(self.noise_scheduler.config.num_train_timesteps)
             for k in self.noise_scheduler.timesteps:
-                noise_pred = self.noise_pred_net(naction, k, global_cond=obs_cond)
+                noise_pred = self.pred_net(naction, k, global_cond=obs_cond)
                 naction = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
 
         return naction
@@ -891,7 +867,7 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
         self.num_timesteps = 1
         self.action_dim = action_dim
 
-        self.action_pred_net = ConditionalUnet1D(
+        self.pred_net = ConditionalUnet1D(
             input_dim=embed_dim,
             global_cond_dim=obs_dim*obs_horizon
         )
@@ -929,11 +905,11 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
         timesteps = torch.full((B,), self.num_timesteps, device=device).long()
 
         noise_emb = self.token_embedding(noise)
-        action_emb_pred = self.action_pred_net(noise_emb, timesteps, global_cond=obs_cond)
+        action_emb_pred = self.pred_net(noise_emb, timesteps, global_cond=obs_cond)
         action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)
 
         loss = torch.nn.functional.cross_entropy(action_pred.permute(0, 2, 1), naction)
-        return loss
+        return loss, action_pred
 
     def sample(self, nobs_t, pred_horizon, device):
         B = nobs_t.shape[0]
@@ -944,7 +920,7 @@ class SingleStepStateBasedDiscreteDiffusionPolicy(nn.Module):
             naction = torch.full((B, pred_horizon * self.action_dim), 0, device=device)
 
             naction_emb = self.token_embedding(naction)
-            action_emb_pred = self.action_pred_net(naction_emb, self.num_timesteps, global_cond=obs_cond)
+            action_emb_pred = self.pred_net(naction_emb, self.num_timesteps, global_cond=obs_cond)
             action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
 
             softmax_logits = torch.softmax(action_pred, dim=-1).detach()
@@ -961,7 +937,7 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
         self.num_timesteps = num_diffusion_iters
         self.action_dim = action_dim
 
-        self.action_pred_net = ConditionalUnet1D(
+        self.pred_net = ConditionalUnet1D(
             input_dim=embed_dim,
             global_cond_dim=obs_dim*obs_horizon
         )
@@ -1009,11 +985,11 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
             naction, noise, 1 - (timesteps.float() / self.num_timesteps)) # 0 -> 1, self.num_timesteps -> 0
 
         noise_emb = self.token_embedding(noised_action)
-        action_emb_pred = self.action_pred_net(noise_emb, timesteps, global_cond=obs_cond)
+        action_emb_pred = self.pred_net(noise_emb, timesteps, global_cond=obs_cond)
         action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)
 
         loss = torch.nn.functional.cross_entropy(action_pred.permute(0, 2, 1), naction)
-        return loss
+        return loss, action_pred
 
     def sample(self, nobs_t, pred_horizon, device):
         B = nobs_t.shape[0]
@@ -1027,7 +1003,7 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
             timesteps = torch.arange(self.num_timesteps, 0, -1, device=device).long()
             for k in timesteps:
                 naction_emb = self.token_embedding(naction)
-                action_emb_pred = self.action_pred_net(naction_emb, k, global_cond=obs_cond)
+                action_emb_pred = self.pred_net(naction_emb, k, global_cond=obs_cond)
                 action_pred = (self.token_embedding.weight @ action_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
 
                 softmax_logits = torch.softmax(action_pred, dim=-1).detach()
@@ -1037,7 +1013,7 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
             # k = self.num_timesteps
             # while k > 0:
             #     naction_emb = self.token_embedding(naction)
-            #     noise_emb_pred = self.noise_pred_net(naction_emb, k, global_cond=obs_cond)
+            #     noise_emb_pred = self.pred_net(naction_emb, k, global_cond=obs_cond)
             #     noise_pred = (self.token_embedding.weight @ noise_emb_pred.transpose(1, 2)).transpose(1, 2)  # (B, C, K)
 
             #     naction, new_k = self.schedule.step(naction, noise_pred, (1 - k / self.num_timesteps)) # 0 -> 1, self.num_timesteps -> 0
@@ -1046,7 +1022,7 @@ class StateBasedDiscreteDiffusionPolicy(nn.Module):
         naction = self.tokenizer.detokenize(naction)
         return naction
             
-def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, embed_dim, schedule_name, pred_horizon=16, obs_horizon=2, action_horizon=6, unet_size="large"):
+def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, embed_dim, schedule_name, pred_horizon=16, obs_horizon=2, action_horizon=6, unet_size="large", ckpt_path=None):
     #@markdown ### **Network Demo**
 
     # observation and action dimensions corrsponding to
@@ -1060,13 +1036,35 @@ def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, e
     # schedule_name = "vanilla"
 
     if policy_name == "continuous":
-        policy = StateBasedDiffusionPolicy(action_dim, obs_dim, obs_horizon, num_diffusion_iters, unet_config=UNET_CONFIGS[unet_size])
+        policy = StateBasedDiffusionPolicy(action_dim, obs_dim, obs_horizon, num_diffusion_iters)
     elif policy_name == "discrete_singlestep":
         policy = SingleStepStateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, tokenizer_name)
     elif policy_name == "discrete":
         policy = StateBasedDiscreteDiffusionPolicy(action_dim, vocab_size, embed_dim, obs_dim, obs_horizon, num_diffusion_iters, tokenizer_name, schedule_name)
     else:
         raise ValueError("invalid policy name")
+    
+    if unet_size != "large":
+        unet_cfg = UNET_CONFIGS[unet_size]
+
+        policy.pred_net = ConditionalUnet1D(
+            input_dim=action_dim,
+            global_cond_dim=obs_dim*obs_horizon,
+            down_dims=unet_cfg["down_dims"],
+            diffusion_step_embed_dim=unet_cfg["diffusion_step_embed_dim"],
+        )
+
+        if unet_cfg["mid_modules"] != 2:
+            policy.pred_net.mid_modules = nn.ModuleList([
+                ConditionalResidualBlock1D(
+                    unet_cfg["down_dims"][-1], unet_cfg["down_dims"][-1],
+                    cond_dim=unet_cfg["diffusion_step_embed_dim"] + obs_dim*obs_horizon
+                ) for _ in range(unet_cfg["mid_modules"])
+            ])
+    
+    if ckpt_path is not None:
+        state_dict = torch.load(ckpt_path, map_location='cuda', weights_only=True)
+        policy.load_state_dict(state_dict)
 
     # example inputs
     noised_action = torch.randn((1, pred_horizon, action_dim))
@@ -1078,17 +1076,14 @@ def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, e
 
     diffusion_iter = torch.zeros((1,))
 
-    if policy_name == "continuous":
-        pred_net = policy.noise_pred_net
     elif policy_name == "discrete_singlestep" or policy_name == "discrete":
-        pred_net = policy.action_pred_net
         noised_action = policy.tokenizer.tokenize(noised_action)
         noised_action = policy.token_embedding(noised_action)
 
     # the noise prediction network
     # takes noisy action, diffusion iteration and observation as input
     # predicts the noise added to action
-    noise = pred_net(
+    noise = policy.pred_net(
         sample=noised_action,
         timestep=diffusion_iter,
         global_cond=obs.flatten(start_dim=1))
@@ -1101,21 +1096,12 @@ def network_demo(policy_name, num_diffusion_iters, tokenizer_name, vocab_size, e
     return policy
 
 
-def train(policy, dataloader, stats, num_epochs, teacher_ckpt_path, load_pretrained=False, pred_horizon=16, obs_horizon=2, action_horizon=8, wandb_name="untitled_run"):
+def distill(policy, teacher_policy, dataloader, stats, num_epochs, load_pretrained=False, pred_horizon=16, obs_horizon=2, action_horizon=8, wandb_name="untitled_run"):
     # device transfer
     device = torch.device('cuda')
     policy = policy.to(device)
-
-    # teacher set up
-
-    teacher_policy = StateBasedDiffusionPolicy(2, 5, obs_horizon, 100)
-    state_dict = torch.load(teacher_ckpt_path, map_location='cuda', weights_only=True)
-    teacher_policy.noise_pred_net.load_state_dict(state_dict)
     teacher_policy = teacher_policy.to(device)
-
-    teacher_ema = EMAModel(teacher_policy.parameters(), power=0.75)
-    teacher_ema.step(teacher_policy.parameters())
-    teacher_ema.copy_to(teacher_policy.parameters())
+    teacher_policy.eval()
 
     #@markdown ### **Training**
     #@markdown
@@ -1182,8 +1168,15 @@ def train(policy, dataloader, stats, num_epochs, teacher_ckpt_path, load_pretrai
                     
                     # (B, obs_horizon, obs_dim)
                     nobs = nobs[:,:obs_horizon,:]
-                    naction_teacher = teacher_policy.sample(nobs, pred_horizon, device)
-                    loss = policy.forward(nobs, naction_teacher, device, teacher=teacher_policy)
+
+                    with torch.no_grad():
+                        _, logits_target = teacher_policy.forward(nobs, naction, device)
+                        p_target = torch.nn.functional.softmax(logits_target, dim=-1)
+
+                    _, logits_pred = policy.forward(nobs, naction, device)
+                    p_pred = torch.nn.functional.log_softmax(logits_pred, dim=-1)
+
+                    loss = torch.nn.functional.kl_div(p_pred, p_target, reduction='batchmean')
 
                     # optimize
                     loss.backward()
@@ -1225,7 +1218,7 @@ def train(policy, dataloader, stats, num_epochs, teacher_ckpt_path, load_pretrai
 
                     state_dict = torch.load(ckpt_path, map_location='cuda', weights_only=True)
                     ema_policy = policy
-                    ema_policy.noise_pred_net.load_state_dict(state_dict)
+                    ema_policy.pred_net.load_state_dict(state_dict)
                     print('Pretrained weights loaded.')
                 else:
                     print("Skipped pretrained weight loading.")
@@ -1383,17 +1376,20 @@ def main():
 
     env = env_demo()
     dataloader, stats = dataset_demo(args.batch_size, args.pred_horizon, args.obs_horizon, args.action_horizon)
+    
     policy = network_demo(args.policy_name, args.num_diffusion_iters, args.tokenizer_name, args.vocab_size, args.embed_dim, args.schedule_name, args.pred_horizon, args.obs_horizon, args.action_horizon, args.student_size)
+    
+    teacher_policy = network_demo(args.policy_name, args.num_diffusion_iters, args.tokenizer_name, args.vocab_size, args.embed_dim, args.schedule_name, args.pred_horizon, args.obs_horizon, args.action_horizon, "large", args.teacher_ckpt_path)
 
     if args.mode == "train":
         assert (args.policy_name == "continuous" or args.load_pretrained == False)
         print(args.policy_name, args.num_diffusion_iters, args.num_epochs, args.vocab_size, args.schedule_name, args.batch_size)
-        train(
+        distill(
             policy, 
+            teacher_policy,
             dataloader, 
             stats, 
             args.num_epochs, 
-            args.teacher_ckpt_path, 
             load_pretrained=args.load_pretrained, 
             pred_horizon=args.pred_horizon, 
             obs_horizon=args.obs_horizon, 
